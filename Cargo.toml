@@ -1,0 +1,21 @@
+[package]
+name = "simd-tests"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+criterion = { version = "*", features = [ "real_blackbox" ] }
+genawaiter = "*"
+num-traits = "*"
+quickcheck = "*"
+quickcheck_macros = "*"
+rand = "*"
+rand_xoshiro = "*"
+rayon = "*"
+core_simd = { path = "../stdsimd/crates/core_simd" }
+
+[[bench]]
+name = "my_benchmark"
+harness = false
