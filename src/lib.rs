@@ -114,6 +114,10 @@ const FINITE_DIFF: [Scalar; 2] = [-1.0, 1.0];
 const SHARPEN3: [Scalar; 3] = [-0.5, 2.0, -0.5];
 const SMOOTH5: [Scalar; 5] = [0.1, 0.2, 0.4, 0.2, 0.1];
 
+// TODO: Automate generation of the batch of functions below so that we can
+//       concisely do it for other convolution implementations. Since Rust
+//       doesn't have GATs yet, this will require macros.
+
 pub fn finite_diff_autovec_sse(input: &[Simd<SSE>], output: &mut [Simd<SSE>]) {
     convolve_autovec(input, &FINITE_DIFF, output);
 }
@@ -247,6 +251,10 @@ mod tests {
         }
         TestResult::passed()
     }
+
+    // TODO: Automate generation of the batch of tests below so that we can
+    //       concisely do it for other convolution implementations. Since Rust
+    //       doesn't have GATs yet, this will require macros.
 
     #[quickcheck]
     fn finite_diff_autovec_sse(input: Vec<Scalar>) -> TestResult {
