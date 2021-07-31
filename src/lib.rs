@@ -87,19 +87,22 @@ fn smart_sum<
 >(
     products: I,
 ) -> T {
+    // Collect the inputs
     assert_eq!(products.size_hint().0, KERNEL_LEN);
-    let mut target = [T::default(); KERNEL_LEN];
-    for (dest, src) in target.iter_mut().zip(products) {
+    let mut buffer = [T::default(); KERNEL_LEN];
+    for (dest, src) in buffer.iter_mut().zip(products) {
         *dest = src;
     }
-    let mut stride = KERNEL_LEN / 2;
+
+    // Perform the summation using a binary tree algorithm
+    let mut stride = KERNEL_LEN.next_power_of_two() / 2;
     while stride > 0 {
-        for i in 0..stride {
-            target[i] += target[i + stride];
+        for i in 0..stride.min(KERNEL_LEN - stride) {
+            buffer[i] += buffer[i + stride];
         }
         stride /= 2;
     }
-    target[0]
+    buffer[0]
 }
 
 // Perform convolution using a scalar algorithm, let compiler autovectorize it
@@ -119,10 +122,7 @@ pub fn convolve_autovec<const LANES: usize, const KERNEL_LEN: usize, const SMART
     let output = scalarize_mut(output);
     assert_ge!(input.len(), kernel.len());
     assert_ge!(output.len(), input.len() - kernel.len() + 1);
-    for (data, output) in input
-        .array_windows::<{ KERNEL_LEN }>()
-        .zip(output.iter_mut())
-    {
+    for (data, output) in input.array_windows::<KERNEL_LEN>().zip(output.iter_mut()) {
         let products = data.iter().zip(kernel.iter()).map(|(&x, &k)| x * k);
         *output = if SMART_SUM {
             smart_sum::<_, _, KERNEL_LEN>(products)
@@ -264,15 +264,33 @@ mod tests {
     where
         LaneCount<LANES>: SupportedLaneCount,
     {
-        if input.len() < KERNEL_LEN {
+        // Reject unreasonable test inputs
+        if input.len() < KERNEL_LEN || !input.iter().copied().all(Scalar::is_normal) {
             return TestResult::discard();
         }
+
+        // Normalize input magnitude to [eps, 1] range for easier error analysis
+        let input_magnitude = input
+            .iter()
+            .fold(Scalar::MIN_POSITIVE, |acc, x| acc.max(x.abs()));
+        let input = input
+            .into_iter()
+            .map(|x| {
+                let mut normalized = x / input_magnitude;
+                if normalized.abs() < Scalar::EPSILON {
+                    normalized = Scalar::EPSILON.copysign(x);
+                }
+                normalized
+            })
+            .collect::<Vec<_>>();
+
+        // Prepare and perform the convolution
         let input_simd = super::simdize::<LANES>(&input);
         let output_len = input_simd.len() * LANES - KERNEL_LEN + 1;
         let mut output_simd = super::allocate_simd::<LANES>(output_len);
-
         convolution(&input_simd, &kernel, &mut output_simd);
 
+        // Check convolution results against a basic reference implementation
         let output = scalarize(&output_simd);
         for (out, ins) in output.into_iter().zip(input.array_windows::<KERNEL_LEN>()) {
             let expected = ins
@@ -280,11 +298,7 @@ mod tests {
                 .zip(kernel.iter())
                 .map(|(&x, &k)| x * k)
                 .sum::<Scalar>();
-            if expected.is_nan() {
-                assert!(out.is_nan());
-            } else {
-                assert_eq!(*out, expected);
-            }
+            assert_le!((*out - expected).abs(), 2.0 * Scalar::EPSILON);
         }
         TestResult::passed()
     }
