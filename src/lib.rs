@@ -137,15 +137,59 @@ pub fn convolve_autovec<const LANES: usize, const KERNEL_LEN: usize, const SMART
     }
 }
 
-// TODO: Start building comparative performance benchmarks
-// TODO: Try to optimize further by reducing the number of loads, through
-//       keeping a ring buffer of last loaded inputs.
+// TODO: Write a manually vectorized version of the convolve_autovec algorithm
+//       that only performs aligned loads, and generates the remaining input
+//       vectors through shuffles. Check out the compiler-generated assembly: if
+//       it features a lot of cross-lane permutes (vpermps, as opposed to
+//       vpermilps or vshufps), hint the compiler into either loading or
+//       generating an intermediate vector that allows lane crossing avoidance.
+//
+//       In other words, make sure the generated assembly doesn't do this...
+//
+//       loada: [x0 x1 x2 x3|x4 x5 x6 x7]
+//       loada:                         [x8 x9 xA xB|xC xD xE xF]
+//       perm:           [x3 x4 x5 x6|x7 ** ** **]  <- x4, x5, x6 cross a lane
+//       perm:           [** ** ** **|** x8 x9 xA]  <- x8, x9, xA cross a lane
+//       blend:          [x3 x4 x5 x6|x7 x8 x9 xA]
+//
+//       ...instead, it should do either this...
+//
+//       loada:   [x0 x1 x2 x3|x4 x5 x6 x7]
+//       loada:                           [x8 x9 xA xB|xC xD xE xF]
+//       shuf128:             [x4 x5 x6 x7|x8 x9 xA xB]
+//
+//       ...or this (not clear which is better, may want to check)...
+//
+//       loada:   [x0 x1 x2 x3|x4 x5 x6 x7]
+//       loadu:               [x4 x5 x6 x7|x8 x9 xA xB]
+//
+//       ...and then do this:
+//
+//       permil/shuf:      [x3 ** ** **|x7 ** ** **]
+//       permil/shuf:      [** x4 x5 x6|** x8 x9 xA]
+//       blend:            [x3 x4 x5 x6|x7 x8 x9 xA]
+//
+//       Note that the permil/blend trio can be avoided for many element shifts:
+//       - Shifts of 4*N directly come from loada and loadu/shuf128
+//       - Shifts of 2 + 4*N can be produced using a single AVX shuffle
+//       - Only shifts of 1 + 4*N and 3 + 4*N need the full permil/blend dance
+//
+//       In any case, try to hand of as much of this shuffle gruntwork to the
+//       compiler as possible. Ideally, the code should be written with two
+//       aligned loads and a core_simd shuffle for each shifted input vector,
+//       and the compiler should do the work of deduplicating the loads and
+//       computing/caching the f128. Only if the output assembly is bad, should
+//       I hint the compiler further into caching loaded values, computing
+//       f128 shuffles...
+//
+// TODO: On Intel processors, FMA might perform better than mul + add (while the
+//       reverse is expected on AMD Zen processors)
 
 // Examples of usage (use cargo asm to show assembly)
-const FINITE_DIFF: [Scalar; 2] = [-1.0, 1.0];
-const SHARPEN3: [Scalar; 3] = [-0.5, 2.0, -0.5];
-const SMOOTH5: [Scalar; 5] = [0.1, 0.2, 0.4, 0.2, 0.1];
-const ANTISYM8: [Scalar; 8] = [0.1, -0.2, 0.4, -0.8, 0.8, -0.4, 0.2, -0.1];
+pub const FINITE_DIFF: [Scalar; 2] = [-1.0, 1.0];
+pub const SHARPEN3: [Scalar; 3] = [-0.5, 2.0, -0.5];
+pub const SMOOTH5: [Scalar; 5] = [0.1, 0.2, 0.4, 0.2, 0.1];
+pub const ANTISYM8: [Scalar; 8] = [0.1, -0.2, 0.4, -0.8, 0.8, -0.4, 0.2, -0.1];
 // TODO: For AVX-512, could also test a 16-wide kernel
 
 // Generate example implementations using above kernels
