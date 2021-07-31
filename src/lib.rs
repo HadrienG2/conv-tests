@@ -5,6 +5,7 @@
 
 use core_simd::{LaneCount, Mask32, SimdF32, SupportedLaneCount};
 use more_asserts::*;
+use paste::paste;
 use std::{iter::TrustedLen, ops::AddAssign};
 
 // SIMD processing parameters
@@ -79,6 +80,10 @@ where
 }
 
 // Iterator summation algorithm that minimizes dependency chain length
+//
+// Inlining is very important, and therefore forced, as we want the summation to
+// be carried out in registers whenever possible.
+//
 #[inline(always)]
 fn smart_sum<
     T: Copy + Default + AddAssign<T>,
@@ -143,41 +148,35 @@ const SMOOTH5: [Scalar; 5] = [0.1, 0.2, 0.4, 0.2, 0.1];
 const ANTISYM8: [Scalar; 8] = [0.1, -0.2, 0.4, -0.8, 0.8, -0.4, 0.2, -0.1];
 // TODO: For AVX-512, could also test a 16-wide kernel
 
-// TODO: Automate generation of the batch of functions below so that we can
-//       concisely do it for other convolution implementations. Since Rust
-//       doesn't have GATs yet, this will require macros.
-
-pub fn finite_diff_autovec_basic(input: &[Simd<WIDEST>], output: &mut [Simd<WIDEST>]) {
-    convolve_autovec::<WIDEST, { FINITE_DIFF.len() }, false>(input, &FINITE_DIFF, output);
+// Generate example implementations using above kernels
+macro_rules! generate_examples {
+    ($impl:ident) => {
+        generate_examples!($impl, SSE);
+        generate_examples!($impl, AVX);
+        // generate_examples!($impl, AVX512);
+    };
+    ($impl:ident, $width:ident) => {
+        generate_examples!($impl, $width, FINITE_DIFF);
+        generate_examples!($impl, $width, SHARPEN3);
+        generate_examples!($impl, $width, SMOOTH5);
+        generate_examples!($impl, $width, ANTISYM8);
+    };
+    ($impl:ident, $width:ident, $kernel:ident) => {
+        generate_examples!($impl, $width, $kernel, false, basic);
+        generate_examples!($impl, $width, $kernel, true, smart);
+    };
+    ($impl:ident, $width:ident, $kernel:ident, $smart:expr, $suffix:ident) => {
+        paste!{
+            pub fn [<$kernel:lower _ $impl _ $suffix _ $width:lower>](input: &[Simd<$width>], output: &mut [Simd<$width>]) {
+                [<convolve_ $impl>]::<$width, { $kernel.len() }, $smart>(input, &$kernel, output);
+            }
+        }
+    }
 }
 
-pub fn sharpen3_autovec_basic(input: &[Simd<WIDEST>], output: &mut [Simd<WIDEST>]) {
-    convolve_autovec::<WIDEST, { SHARPEN3.len() }, false>(input, &SHARPEN3, output);
-}
-
-pub fn smooth5_autovec_basic(input: &[Simd<WIDEST>], output: &mut [Simd<WIDEST>]) {
-    convolve_autovec::<WIDEST, { SMOOTH5.len() }, false>(input, &SMOOTH5, output);
-}
-
-pub fn antisym8_autovec_basic(input: &[Simd<WIDEST>], output: &mut [Simd<WIDEST>]) {
-    convolve_autovec::<WIDEST, { ANTISYM8.len() }, false>(input, &ANTISYM8, output);
-}
-
-pub fn finite_diff_autovec_smart(input: &[Simd<WIDEST>], output: &mut [Simd<WIDEST>]) {
-    convolve_autovec::<WIDEST, { FINITE_DIFF.len() }, true>(input, &FINITE_DIFF, output);
-}
-
-pub fn sharpen3_autovec_smart(input: &[Simd<WIDEST>], output: &mut [Simd<WIDEST>]) {
-    convolve_autovec::<WIDEST, { SHARPEN3.len() }, true>(input, &SHARPEN3, output);
-}
-
-pub fn smooth5_autovec_smart(input: &[Simd<WIDEST>], output: &mut [Simd<WIDEST>]) {
-    convolve_autovec::<WIDEST, { SMOOTH5.len() }, true>(input, &SMOOTH5, output);
-}
-
-pub fn antisym8_autovec_smart(input: &[Simd<WIDEST>], output: &mut [Simd<WIDEST>]) {
-    convolve_autovec::<WIDEST, { ANTISYM8.len() }, true>(input, &ANTISYM8, output);
-}
+// No need to support multiple vector widths for autovectorized version, it will
+// use max-width AVX with unaligned operands anyway (and that's okay)
+generate_examples!(autovec, WIDEST);
 
 #[cfg(test)]
 mod tests {
@@ -303,151 +302,36 @@ mod tests {
         TestResult::passed()
     }
 
-    // TODO: Automate generation of the batch of tests below so that we can
-    //       concisely do it for other convolution implementations. Since Rust
-    //       doesn't have GATs yet, this will require macros.
-
-    #[quickcheck]
-    fn finite_diff_autovec_basic_sse(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<SSE, { FINITE_DIFF.len() }, false>,
-            input,
-            &FINITE_DIFF,
-        )
+    // Generate tests for a given convolution implementation, for all SIMD
+    // widths, example kernels, and summation algorithms
+    macro_rules! generate_tests {
+        ($impl:ident) => {
+            generate_tests!($impl, SSE);
+            generate_tests!($impl, AVX);
+            // generate_tests!($impl, AVX512);
+        };
+        ($impl:ident, $width:ident) => {
+            generate_tests!($impl, $width, FINITE_DIFF);
+            generate_tests!($impl, $width, SHARPEN3);
+            generate_tests!($impl, $width, SMOOTH5);
+            generate_tests!($impl, $width, ANTISYM8);
+        };
+        ($impl:ident, $width:ident, $kernel:ident) => {
+            generate_tests!($impl, $width, $kernel, false, basic);
+            generate_tests!($impl, $width, $kernel, true, smart);
+        };
+        ($impl:ident, $width:ident, $kernel:ident, $smart:expr, $suffix:ident) => {
+            paste!{
+                #[quickcheck]
+                fn [<$kernel:lower _ $impl _ $suffix _ $width:lower>](input: Vec<Scalar>) -> TestResult {
+                    convolve(
+                        super::[<convolve_ $impl>]::<$width, { $kernel.len() }, $smart>,
+                        input,
+                        &$kernel,
+                    )
+                }
+            }
+        }
     }
-
-    #[quickcheck]
-    fn finite_diff_autovec_basic_avx(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<AVX, { FINITE_DIFF.len() }, false>,
-            input,
-            &FINITE_DIFF,
-        )
-    }
-
-    #[quickcheck]
-    fn sharpen3_autovec_basic_sse(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<SSE, { SHARPEN3.len() }, false>,
-            input,
-            &SHARPEN3,
-        )
-    }
-
-    #[quickcheck]
-    fn sharpen3_autovec_basic_avx(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<AVX, { SHARPEN3.len() }, false>,
-            input,
-            &SHARPEN3,
-        )
-    }
-
-    #[quickcheck]
-    fn smooth5_autovec_basic_sse(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<SSE, { SMOOTH5.len() }, false>,
-            input,
-            &SMOOTH5,
-        )
-    }
-
-    #[quickcheck]
-    fn smooth5_autovec_basic_avx(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<AVX, { SMOOTH5.len() }, false>,
-            input,
-            &SMOOTH5,
-        )
-    }
-
-    #[quickcheck]
-    fn antisym8_autovec_basic_sse(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<SSE, { ANTISYM8.len() }, false>,
-            input,
-            &ANTISYM8,
-        )
-    }
-
-    #[quickcheck]
-    fn antisym8_autovec_basic_avx(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<AVX, { ANTISYM8.len() }, false>,
-            input,
-            &ANTISYM8,
-        )
-    }
-
-    #[quickcheck]
-    fn finite_diff_autovec_smart_sse(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<SSE, { FINITE_DIFF.len() }, true>,
-            input,
-            &FINITE_DIFF,
-        )
-    }
-
-    #[quickcheck]
-    fn finite_diff_autovec_smart_avx(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<AVX, { FINITE_DIFF.len() }, true>,
-            input,
-            &FINITE_DIFF,
-        )
-    }
-
-    #[quickcheck]
-    fn sharpen3_autovec_smart_sse(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<SSE, { SHARPEN3.len() }, true>,
-            input,
-            &SHARPEN3,
-        )
-    }
-
-    #[quickcheck]
-    fn sharpen3_autovec_smart_avx(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<AVX, { SHARPEN3.len() }, true>,
-            input,
-            &SHARPEN3,
-        )
-    }
-
-    #[quickcheck]
-    fn smooth5_autovec_smart_sse(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<SSE, { SMOOTH5.len() }, true>,
-            input,
-            &SMOOTH5,
-        )
-    }
-
-    #[quickcheck]
-    fn smooth5_autovec_smart_avx(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<AVX, { SMOOTH5.len() }, true>,
-            input,
-            &SMOOTH5,
-        )
-    }
-
-    #[quickcheck]
-    fn antisym8_autovec_smart_sse(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<SSE, { ANTISYM8.len() }, true>,
-            input,
-            &ANTISYM8,
-        )
-    }
-
-    #[quickcheck]
-    fn antisym8_autovec_smart_avx(input: Vec<Scalar>) -> TestResult {
-        convolve(
-            super::convolve_autovec::<AVX, { ANTISYM8.len() }, true>,
-            input,
-            &ANTISYM8,
-        )
-    }
+    generate_tests!(autovec);
 }

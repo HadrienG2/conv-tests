@@ -12,6 +12,7 @@ criterion = { version = "*", features = [ "real_blackbox" ] }
 genawaiter = "*"
 more-asserts = "*"
 num-traits = "*"
+paste = "*"
 quickcheck = "*"
 quickcheck_macros = "*"
 rand = "*"
