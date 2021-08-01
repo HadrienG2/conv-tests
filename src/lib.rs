@@ -137,51 +137,106 @@ pub fn convolve_autovec<const LANES: usize, const KERNEL_LEN: usize, const SMART
     }
 }
 
-// TODO: Write a manually vectorized version of the convolve_autovec algorithm
-//       that only performs aligned loads, and generates the remaining input
-//       vectors through shuffles. Check out the compiler-generated assembly: if
-//       it features a lot of cross-lane permutes (vpermps, as opposed to
-//       vpermilps or vshufps), hint the compiler into either loading or
-//       generating an intermediate vector that allows lane crossing avoidance.
-//
-//       In other words, make sure the generated assembly doesn't do this...
-//
-//       loada: [x0 x1 x2 x3|x4 x5 x6 x7]
-//       loada:                         [x8 x9 xA xB|xC xD xE xF]
-//       perm:           [x3 x4 x5 x6|x7 ** ** **]  <- x4, x5, x6 cross a lane
-//       perm:           [** ** ** **|** x8 x9 xA]  <- x8, x9, xA cross a lane
-//       blend:          [x3 x4 x5 x6|x7 x8 x9 xA]
-//
-//       ...instead, it should do either this...
-//
-//       loada:   [x0 x1 x2 x3|x4 x5 x6 x7]
-//       loada:                           [x8 x9 xA xB|xC xD xE xF]
-//       shuf128:             [x4 x5 x6 x7|x8 x9 xA xB]
-//
-//       ...or this (not clear which is better, may want to check)...
-//
-//       loada:   [x0 x1 x2 x3|x4 x5 x6 x7]
-//       loadu:               [x4 x5 x6 x7|x8 x9 xA xB]
-//
-//       ...and then do this:
-//
-//       permil/shuf:      [x3 ** ** **|x7 ** ** **]
-//       permil/shuf:      [** x4 x5 x6|** x8 x9 xA]
-//       blend:            [x3 x4 x5 x6|x7 x8 x9 xA]
-//
-//       Note that the permil/blend trio can be avoided for many element shifts:
-//       - Shifts of 4*N directly come from loada and loadu/shuf128
-//       - Shifts of 2 + 4*N can be produced using a single AVX shuffle
-//       - Only shifts of 1 + 4*N and 3 + 4*N need the full permil/blend dance
-//
-//       In any case, try to hand of as much of this shuffle gruntwork to the
-//       compiler as possible. Ideally, the code should be written with two
-//       aligned loads and a core_simd shuffle for each shifted input vector,
-//       and the compiler should do the work of deduplicating the loads and
-//       computing/caching the f128. Only if the output assembly is bad, should
-//       I hint the compiler further into caching loaded values, computing
-//       f128 shuffles...
-//
+// TODO: Should codegen this using macros
+
+#[allow(unused)]
+fn simd_shift_2(left: Simd<2>, right: Simd<2>, shift: usize) -> Simd<2> {
+    match shift {
+        0 => left,
+        1 => left.shuffle::<{ [1, 2] }>(right),
+        2 => right,
+        _ => unreachable!("Bad shift value"),
+    }
+}
+
+#[allow(unused)]
+fn simd_shift_4(left: Simd<4>, right: Simd<4>, shift: usize) -> Simd<4> {
+    match shift {
+        0 => left,
+        1 => left.shuffle::<{ [1, 2, 3, 4] }>(right),
+        2 => left.shuffle::<{ [2, 3, 4, 5] }>(right),
+        3 => left.shuffle::<{ [3, 4, 5, 6] }>(right),
+        4 => right,
+        _ => unreachable!("Bad shift value"),
+    }
+}
+
+fn simd_shift_8(left: Simd<8>, right: Simd<8>, shift: usize) -> Simd<8> {
+    match shift {
+        0 => left,
+        1 => left.shuffle::<{ [1, 2, 3, 4, 5, 6, 7, 8] }>(right),
+        2 => left.shuffle::<{ [2, 3, 4, 5, 6, 7, 8, 9] }>(right),
+        3 => left.shuffle::<{ [3, 4, 5, 6, 7, 8, 9, 10] }>(right),
+        4 => left.shuffle::<{ [4, 5, 6, 7, 8, 9, 10, 11] }>(right),
+        5 => left.shuffle::<{ [5, 6, 7, 8, 9, 10, 11, 12] }>(right),
+        6 => left.shuffle::<{ [6, 7, 8, 9, 10, 11, 12, 13] }>(right),
+        7 => left.shuffle::<{ [7, 8, 9, 10, 11, 12, 13, 14] }>(right),
+        8 => right,
+        _ => unreachable!("Bad shift value"),
+    }
+}
+
+// TODO: Should add a _16 version for AVX-512
+
+// Variant of the convolution algorithm that minimizes the number of loads and
+// makes the loads as efficient as possible, at the cost of using a lot more
+// shuffles. On Zen 2, this is not a good tradeoff.
+struct MinimalLoads<const LANES: usize>;
+
+macro_rules! gen_minimal_loads_convolve {
+    ($($lanes:expr),*) => {
+        $( paste!{
+            impl MinimalLoads<$lanes> {
+                #[inline(always)]
+                fn convolve<const KERNEL_LEN: usize, const SMART_SUM: bool>(
+                    input: &[Simd<$lanes>],
+                    kernel: &[Scalar; KERNEL_LEN],
+                    output: &mut [Simd<$lanes>]
+                ) {
+                    // Validate inputs
+                    assert_ge!(input.len()*$lanes, KERNEL_LEN, "Convolution input is smaller than convolution kernel length");
+                    assert_ge!(output.len()*$lanes, input.len()*$lanes - KERNEL_LEN + 1, "Convolution output buffer is smaller than output length");
+
+                    // Perform vectorized convolution
+                    let kernel_len_vecs = div_round_up(KERNEL_LEN-1, $lanes) + 1;
+                    for (out_vec, in_aligned_vecs) in output.iter_mut().zip(input.windows(kernel_len_vecs)) {
+                        let products = kernel.iter().enumerate().map(|(shift, &kernel_elem)| {
+                            let vec_shift = shift / $lanes;
+                            let elem_shift = shift % $lanes;
+                            let left_vec = in_aligned_vecs[vec_shift];
+                            let in_vec = if elem_shift == 0 {
+                                left_vec
+                            } else {
+                                let right_vec = in_aligned_vecs[vec_shift + 1];
+                                [< simd_shift_ $lanes >](left_vec, right_vec, elem_shift)
+                            };
+                            in_vec * Simd::<$lanes>::splat(kernel_elem)
+                        });
+                        *out_vec = if SMART_SUM {
+                            smart_sum::<_, _, KERNEL_LEN>(products)
+                        } else {
+                            products.sum()
+                        };
+                    }
+
+                    // Compute tail elements (if any) using scalar algorithm
+                    let num_out_vecs = output.len();
+                    let num_ins_windows = input.windows(kernel_len_vecs).count();
+                    debug_assert_ge!(num_out_vecs, num_ins_windows);
+                    if num_out_vecs > num_ins_windows {
+                        convolve_autovec::<$lanes, KERNEL_LEN, false>(&input[num_ins_windows..], kernel, &mut output[num_ins_windows..]);
+                    }
+                }
+            }
+        } )*
+    };
+}
+
+gen_minimal_loads_convolve!(4, 8 /*, 16*/);
+
+// TODO: Allow SSE-shifted unaligned loads to reduce dependency tree depth
+//       by eliminating the vperm128 operation.
+
 // TODO: On Intel processors, FMA might perform better than mul + add (while the
 //       reverse is expected on AMD Zen processors)
 
@@ -209,10 +264,17 @@ macro_rules! generate_examples {
         generate_examples!($impl, $width, $kernel, false, basic);
         generate_examples!($impl, $width, $kernel, true, smart);
     };
-    ($impl:ident, $width:ident, $kernel:ident, $smart:expr, $suffix:ident) => {
+    (autovec, $width:ident, $kernel:ident, $smart:expr, $suffix:ident) => {
         paste!{
-            pub fn [<$kernel:lower _ $impl _ $suffix _ $width:lower>](input: &[Simd<$width>], output: &mut [Simd<$width>]) {
-                [<convolve_ $impl>]::<$width, { $kernel.len() }, $smart>(input, &$kernel, output);
+            pub fn [<$kernel:lower _autovec_ $suffix _ $width:lower>](input: &[Simd<$width>], output: &mut [Simd<$width>]) {
+                convolve_autovec::<$width, { $kernel.len() }, $smart>(input, &$kernel, output);
+            }
+        }
+    };
+    ($simd_impl:ident, $width:ident, $kernel:ident, $smart:expr, $suffix:ident) => {
+        paste!{
+            pub fn [<$kernel:lower _ $simd_impl:snake:lower _ $suffix _ $width:lower>](input: &[Simd<$width>], output: &mut [Simd<$width>]) {
+                $simd_impl::<$width>::convolve::<{ $kernel.len() }, $smart>(input, &$kernel, output);
             }
         }
     }
@@ -221,6 +283,7 @@ macro_rules! generate_examples {
 // No need to support multiple vector widths for autovectorized version, it will
 // use max-width AVX with unaligned operands anyway (and that's okay)
 generate_examples!(autovec, WIDEST);
+generate_examples!(MinimalLoads, WIDEST);
 
 #[cfg(test)]
 mod tests {
@@ -335,13 +398,30 @@ mod tests {
 
         // Check convolution results against a basic reference implementation
         let output = scalarize(&output_simd);
-        for (out, ins) in output.into_iter().zip(input.array_windows::<KERNEL_LEN>()) {
+        for (output_idx, (out, ins)) in output
+            .into_iter()
+            .zip(input.array_windows::<KERNEL_LEN>())
+            .enumerate()
+        {
             let expected = ins
                 .iter()
                 .zip(kernel.iter())
                 .map(|(&x, &k)| x * k)
                 .sum::<Scalar>();
-            assert_le!((*out - expected).abs(), 2.0 * Scalar::EPSILON);
+            assert_le!(
+                (*out - expected).abs(),
+                2.0 * Scalar::EPSILON,
+                "At output index {}/{}, fed inputs {:?} (from input indices {}->{}/{}) into kernel {:?} and got output {} instead of expected {}",
+                output_idx,
+                output_len-1,
+                ins,
+                output_idx,
+                output_idx + KERNEL_LEN-1,
+                input.len()-1,
+                kernel,
+                out,
+                expected
+            );
         }
         TestResult::passed()
     }
@@ -364,12 +444,24 @@ mod tests {
             generate_tests!($impl, $width, $kernel, false, basic);
             generate_tests!($impl, $width, $kernel, true, smart);
         };
-        ($impl:ident, $width:ident, $kernel:ident, $smart:expr, $suffix:ident) => {
+        (autovec, $width:ident, $kernel:ident, $smart:expr, $suffix:ident) => {
             paste!{
                 #[quickcheck]
-                fn [<$kernel:lower _ $impl _ $suffix _ $width:lower>](input: Vec<Scalar>) -> TestResult {
+                fn [<$kernel:lower _autovec_ $suffix _ $width:lower>](input: Vec<Scalar>) -> TestResult {
                     convolve(
-                        super::[<convolve_ $impl>]::<$width, { $kernel.len() }, $smart>,
+                        super::convolve_autovec::<$width, { $kernel.len() }, $smart>,
+                        input,
+                        &$kernel,
+                    )
+                }
+            }
+        };
+        ($simd_impl:ident, $width:ident, $kernel:ident, $smart:expr, $suffix:ident) => {
+            paste!{
+                #[quickcheck]
+                fn [<$kernel:lower _ $simd_impl:snake:lower _ $suffix _ $width:lower>](input: Vec<Scalar>) -> TestResult {
+                    convolve(
+                        super::$simd_impl::<$width>::convolve::<{ $kernel.len() }, $smart>,
                         input,
                         &$kernel,
                     )
@@ -378,4 +470,5 @@ mod tests {
         }
     }
     generate_tests!(autovec);
+    generate_tests!(MinimalLoads);
 }

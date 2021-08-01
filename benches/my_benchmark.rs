@@ -50,9 +50,6 @@ fn criterion_benchmark(c: &mut Criterion) {
             };
 
             // Measure throughput as bytes of input processed per second
-            let mut input = simd_tests::allocate_simd(input_len);
-            let scalar_input = simd_tests::scalarize_mut(&mut input);
-            scalar_input.try_fill(&mut rng).unwrap();
             macro_rules! generate_benchmarks {
                 ($impl:ident) => {
                     generate_benchmarks!($impl, SSE);
@@ -81,6 +78,9 @@ fn criterion_benchmark(c: &mut Criterion) {
                         FigureOfMerit::Muls => group.throughput(Throughput::Elements(num_muls as _)),
                         FigureOfMerit::Adds => group.throughput(Throughput::Elements(num_adds as _)),
                     };
+                    let mut input = simd_tests::allocate_simd(input_len);
+                    let scalar_input = simd_tests::scalarize_mut(&mut input);
+                    scalar_input.try_fill(&mut rng).unwrap();
                     let mut output = simd_tests::allocate_simd(output_elems);
                     paste!{
                         group.bench_function(&format!("{:?} cache, {} kernel, {} impl, {} sum, {} vectorization", cache_level, stringify!([<$kernel:lower>]), stringify!($impl), stringify!($suffix), stringify!([<$width:lower>])),
@@ -93,6 +93,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                 }
             }
             generate_benchmarks!(autovec, WIDEST);
+            generate_benchmarks!(minimal_loads, WIDEST);
         }
     }
 }
