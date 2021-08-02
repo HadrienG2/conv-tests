@@ -28,7 +28,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     const L3_TOTAL_CAPACITY: usize = 2 * L3_CCX_CAPACITY;
     for figure_of_merit in [
         FigureOfMerit::InputBytes,
-        /* FigureOfMerit::OutputBytes, */
+        FigureOfMerit::OutputBytes,
         FigureOfMerit::Muls,
         FigureOfMerit::Adds,
     ] {
