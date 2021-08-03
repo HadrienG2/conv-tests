@@ -6,7 +6,7 @@
 use core_simd::{LaneCount, Mask32, SimdF32, SupportedLaneCount};
 use more_asserts::*;
 use paste::paste;
-use std::{iter::TrustedLen, ops::AddAssign};
+use std::ops::AddAssign;
 
 // SIMD processing parameters
 pub type Scalar = f32;
@@ -85,11 +85,7 @@ where
 // be carried out in registers whenever possible.
 //
 #[inline(always)]
-fn smart_sum<
-    T: Copy + Default + AddAssign<T>,
-    I: Iterator<Item = T> + TrustedLen,
-    const KERNEL_LEN: usize,
->(
+fn smart_sum<T: Copy + Default + AddAssign<T>, I: Iterator<Item = T>, const KERNEL_LEN: usize>(
     products: I,
 ) -> T {
     // Collect the inputs
@@ -137,6 +133,65 @@ pub fn convolve_autovec<const LANES: usize, const KERNEL_LEN: usize, const SMART
     }
 }
 
+// Manually vectorized version of the autovectorized code
+//
+// Slightly faster because the autovectorizer failed to take advantage of data
+// alignment, which the manually vectorized version does leverage.
+//
+struct Manual<const LANES: usize>;
+
+macro_rules! gen_manual_convolve {
+    ($($lanes:expr),*) => {
+        $( paste!{
+            impl Manual<$lanes> {
+                #[inline(always)]
+                fn convolve<const KERNEL_LEN: usize, const SMART_SUM: bool>(
+                    input: &[Simd<$lanes>],
+                    kernel: &[Scalar; KERNEL_LEN],
+                    output: &mut [Simd<$lanes>]
+                ) {
+                    // Validate inputs
+                    assert_ge!(input.len()*$lanes, KERNEL_LEN, "Convolution input is smaller than convolution kernel length");
+                    assert_ge!(output.len()*$lanes, input.len()*$lanes - KERNEL_LEN + 1, "Convolution output buffer is smaller than output length");
+
+                    // Perform vectorized convolution
+                    let kernel_len_vecs = div_round_up(KERNEL_LEN-1, $lanes) + 1;
+                    for (out_vec, in_aligned_vecs) in output.iter_mut().zip(input.windows(kernel_len_vecs)) {
+                        // Collect unaligned convolution inputs
+                        let in_vecs_iter = scalarize(in_aligned_vecs)
+                            .array_windows::<$lanes>()
+                            .copied()
+                            .map(Simd::<$lanes>::from_array);
+
+                        // Compute products with kernel
+                        let products = kernel.iter().zip(in_vecs_iter).map(|(&kernel_elem, in_vec)| {
+                            in_vec * Simd::<$lanes>::splat(kernel_elem)
+                        });
+
+                        // Sum inputs using an algorithm of variable cleverness
+                        *out_vec = if SMART_SUM {
+                            smart_sum::<_, _, KERNEL_LEN>(products)
+                        } else {
+                            products.sum()
+                        };
+                    }
+
+                    // Compute tail elements (if any) using scalar algorithm
+                    let num_out_vecs = output.len();
+                    let num_ins_windows = input.windows(kernel_len_vecs).count();
+                    debug_assert_ge!(num_out_vecs, num_ins_windows);
+                    if num_out_vecs > num_ins_windows {
+                        convolve_autovec::<$lanes, KERNEL_LEN, false>(&input[num_ins_windows..], kernel, &mut output[num_ins_windows..]);
+                    }
+                }
+            }
+        } )*
+    };
+}
+
+gen_manual_convolve!(4, 8 /*, 16*/);
+
+// Element-shifting interpolation between two consecutive vectors
 // TODO: Should codegen this using macros
 
 #[allow(unused)]
@@ -234,8 +289,98 @@ macro_rules! gen_minimal_loads_convolve {
 
 gen_minimal_loads_convolve!(4, 8 /*, 16*/);
 
-// TODO: Allow SSE-shifted unaligned loads to reduce dependency tree depth
-//       by eliminating the vperm128 operation.
+// A shuffle pattern that is efficient on x86 CPUs with SSE/AVX
+// TODO: Should codegen this using macros
+
+#[allow(unused)]
+fn simd_shuf2_4(base: Simd<4>, shift4: Simd<4>) -> Simd<4> {
+    // base   is [ 0 1 2 3 ]
+    // shift4 is [ 4 5 6 7 ]
+    // output is [ 2 3 4 5 ]
+    base.shuffle::<{ [2, 3, 4, 5] }>(shift4)
+}
+
+fn simd_shuf2_8(base: Simd<8>, shift4: Simd<8>) -> Simd<8> {
+    // base   is [ 0 1 2 3 | 4 5 6 7 ]
+    // shift4 is [ 4 5 6 7 | 8 9 10 11 ]
+    // output is [ 2 3 4 5 | 6 7 8 9 ]
+    base.shuffle::<{ [2, 3, 8, 9, 6, 7, 12, 13] }>(shift4)
+}
+
+// TODO: Should add a _16 version for AVX-512
+
+// Variant of the convolution algorithm that tries to strike a balance between
+// reducing the number of unaligned loads (which bound the performance of the
+// naive algorithm) and adding as few shuffles as possible (since these compete
+// with adds an muls for SIMD execution ports on Zen2).
+//
+// Interestingly enough, this is still not beneficial, because it results in
+// turning memory operands into MOVs, which also has a cost.
+//
+struct Shuf2Loadu<const LANES: usize>;
+
+macro_rules! gen_shuf2_loadu_convolve {
+    ($($lanes:expr),*) => {
+        $( paste!{
+            impl Shuf2Loadu<$lanes> {
+                #[inline(always)]
+                fn convolve<const KERNEL_LEN: usize, const SMART_SUM: bool>(
+                    input: &[Simd<$lanes>],
+                    kernel: &[Scalar; KERNEL_LEN],
+                    output: &mut [Simd<$lanes>]
+                ) {
+                    // Validate inputs
+                    assert_ge!(input.len()*$lanes, KERNEL_LEN, "Convolution input is smaller than convolution kernel length");
+                    assert_ge!(output.len()*$lanes, input.len()*$lanes - KERNEL_LEN + 1, "Convolution output buffer is smaller than output length");
+
+                    // Perform vectorized convolution
+                    let kernel_len_vecs = div_round_up(KERNEL_LEN-1, $lanes) + 1;
+                    for (out_vec, in_aligned_vecs) in output.iter_mut().zip(input.windows(kernel_len_vecs)) {
+                        // Collect unaligned convolution inputs
+                        let in_vecs_iter = scalarize(in_aligned_vecs)
+                            .array_windows::<$lanes>()
+                            .copied()
+                            .map(Simd::<$lanes>::from_array);
+                        let mut in_vecs = [Default::default(); KERNEL_LEN];
+                        for (in_vec, data) in in_vecs.iter_mut().zip(in_vecs_iter) {
+                            *in_vec = data;
+                        }
+
+                        // Compute products with kernel, only using a subset of inputs
+                        let products = kernel.iter().enumerate().map(|(idx, &kernel_elem)| {
+                            let elem_idx = idx % $lanes;
+                            let in_vec = if (elem_idx == 2 || elem_idx == 3) && idx < KERNEL_LEN-2 {
+                                // Inputs 2 and 3 are interpolated from inputs (0, 1, 4, 5) using shuffles
+                                [< simd_shuf2_ $lanes >](in_vecs[idx-2], in_vecs[idx+2])
+                            } else {
+                                // Other inputs are accessed using unaligned loads
+                                in_vecs[idx]
+                            };
+                            in_vec * Simd::<$lanes>::splat(kernel_elem)
+                        });
+
+                        // Sum inputs using an algorithm of variable cleverness
+                        *out_vec = if SMART_SUM {
+                            smart_sum::<_, _, KERNEL_LEN>(products)
+                        } else {
+                            products.sum()
+                        };
+                    }
+
+                    // Compute tail elements (if any) using scalar algorithm
+                    let num_out_vecs = output.len();
+                    let num_ins_windows = input.windows(kernel_len_vecs).count();
+                    debug_assert_ge!(num_out_vecs, num_ins_windows);
+                    if num_out_vecs > num_ins_windows {
+                        convolve_autovec::<$lanes, KERNEL_LEN, false>(&input[num_ins_windows..], kernel, &mut output[num_ins_windows..]);
+                    }
+                }
+            }
+        } )*
+    };
+}
+
+gen_shuf2_loadu_convolve!(4, 8 /*, 16*/);
 
 // TODO: On Intel processors, FMA might perform better than mul + add (while the
 //       reverse is expected on AMD Zen processors)
@@ -266,6 +411,7 @@ macro_rules! generate_examples {
     };
     (autovec, $width:ident, $kernel:ident, $smart:expr, $suffix:ident) => {
         paste!{
+            #[inline(never)]
             pub fn [<$kernel:lower _autovec_ $suffix _ $width:lower>](input: &[Simd<$width>], output: &mut [Simd<$width>]) {
                 convolve_autovec::<$width, { $kernel.len() }, $smart>(input, &$kernel, output);
             }
@@ -273,6 +419,7 @@ macro_rules! generate_examples {
     };
     ($simd_impl:ident, $width:ident, $kernel:ident, $smart:expr, $suffix:ident) => {
         paste!{
+            #[inline(never)]
             pub fn [<$kernel:lower _ $simd_impl:snake:lower _ $suffix _ $width:lower>](input: &[Simd<$width>], output: &mut [Simd<$width>]) {
                 $simd_impl::<$width>::convolve::<{ $kernel.len() }, $smart>(input, &$kernel, output);
             }
@@ -283,6 +430,8 @@ macro_rules! generate_examples {
 // No need to support multiple vector widths for autovectorized version, it will
 // use max-width AVX with unaligned operands anyway (and that's okay)
 generate_examples!(autovec, WIDEST);
+generate_examples!(Manual, WIDEST);
+generate_examples!(Shuf2Loadu, WIDEST);
 generate_examples!(MinimalLoads, WIDEST);
 
 #[cfg(test)]
@@ -470,5 +619,7 @@ mod tests {
         }
     }
     generate_tests!(autovec);
+    generate_tests!(Manual);
     generate_tests!(MinimalLoads);
+    generate_tests!(Shuf2Loadu);
 }

@@ -1,4 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+#![feature(bench_black_box)]
+
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use paste::paste;
 use rand::Fill;
 use simd_tests::{Scalar, ANTISYM8, FINITE_DIFF, SHARPEN3, SMOOTH5, WIDEST};
@@ -85,14 +87,16 @@ fn criterion_benchmark(c: &mut Criterion) {
                     paste!{
                         group.bench_function(&format!("{:?} cache, {} kernel, {} impl, {} sum, {} vectorization", cache_level, stringify!([<$kernel:lower>]), stringify!($impl), stringify!($suffix), stringify!([<$width:lower>])),
                             |b| {
-                                b.iter(|| simd_tests::[<$kernel:lower _ $impl _ $suffix _ $width:lower>](black_box(&input), &mut output));
-                                black_box(&mut output);
+                                b.iter(|| simd_tests::[<$kernel:lower _ $impl _ $suffix _ $width:lower>](std::hint::black_box(&input), &mut output));
+                                std::hint::black_box(&mut output);
                             }
                         );
                     }
                 }
             }
             generate_benchmarks!(autovec, WIDEST);
+            generate_benchmarks!(manual, WIDEST);
+            generate_benchmarks!(shuf2_loadu, WIDEST);
             generate_benchmarks!(minimal_loads, WIDEST);
         }
     }
