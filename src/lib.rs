@@ -23,7 +23,10 @@ const fn simd_lanes(simd_bits: usize) -> usize {
 pub const SSE: usize = simd_lanes(128);
 pub const AVX: usize = simd_lanes(256);
 // pub const AVX512: usize = simd_lanes(512);
+#[cfg(target_feature = "avx")]
 pub const WIDEST: usize = AVX; /* AVX512 */
+#[cfg(not(target_feature = "avx"))]
+pub const WIDEST: usize = SSE; /* AVX512 */
 
 // Divide X by Y, rounding upwards
 const fn div_round_up(num: usize, denom: usize) -> usize {

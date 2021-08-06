@@ -1,9 +1,9 @@
 #![feature(bench_black_box)]
 
+use conv_tests::{Scalar, ANTISYM8, FINITE_DIFF, SHARPEN3, SMOOTH5};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use paste::paste;
 use rand::Fill;
-use simd_tests::{Scalar, ANTISYM8, FINITE_DIFF, SHARPEN3, SMOOTH5, WIDEST};
 
 #[derive(Debug)]
 enum CacheLevel {
@@ -37,10 +37,10 @@ fn criterion_benchmark(c: &mut Criterion) {
         let mut group = c.benchmark_group(format!("{:?}", figure_of_merit));
         for cache_level in [
             CacheLevel::L1,
-            /*CacheLevel::L2,
+            CacheLevel::L2,
             CacheLevel::LocalL3,
             CacheLevel::RemoteL3,
-            CacheLevel::DRAM,*/
+            CacheLevel::DRAM,
         ] {
             // Select input/output size to match a certain CPU cache level
             let input_len = match cache_level {
@@ -65,7 +65,8 @@ fn criterion_benchmark(c: &mut Criterion) {
                     generate_benchmarks!($impl, $width, ANTISYM8);
                 };
                 ($impl:ident, $width:ident, $kernel:ident) => {
-                    generate_benchmarks!($impl, $width, $kernel, false, basic);
+                    // NOTE: Disabled basic sum, since it's always worse or equivalent
+                    // generate_benchmarks!($impl, $width, $kernel, false, basic);
                     generate_benchmarks!($impl, $width, $kernel, true, smart);
                 };
                 ($impl:ident, $width:ident, $kernel:ident, $smart:expr, $suffix:ident) => {
@@ -80,14 +81,14 @@ fn criterion_benchmark(c: &mut Criterion) {
                         FigureOfMerit::Muls => group.throughput(Throughput::Elements(num_muls as _)),
                         FigureOfMerit::Adds => group.throughput(Throughput::Elements(num_adds as _)),
                     };
-                    let mut input = simd_tests::allocate_simd(input_len);
-                    let scalar_input = simd_tests::scalarize_mut(&mut input);
+                    let mut input = conv_tests::allocate_simd(input_len);
+                    let scalar_input = conv_tests::scalarize_mut(&mut input);
                     scalar_input.try_fill(&mut rng).unwrap();
-                    let mut output = simd_tests::allocate_simd(output_elems);
+                    let mut output = conv_tests::allocate_simd(output_elems);
                     paste!{
                         group.bench_function(&format!("{:?} cache, {} kernel, {} impl, {} sum, {} vectorization", cache_level, stringify!([<$kernel:lower>]), stringify!($impl), stringify!($suffix), stringify!([<$width:lower>])),
                             |b| {
-                                b.iter(|| simd_tests::[<$kernel:lower _ $impl _ $suffix _ $width:lower>](std::hint::black_box(&input), &mut output));
+                                b.iter(|| conv_tests::[<$kernel:lower _ $impl _ $suffix _ $width:lower>](std::hint::black_box(&input), &mut output));
                                 std::hint::black_box(&mut output);
                             }
                         );

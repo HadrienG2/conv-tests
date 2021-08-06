@@ -1,7 +1,7 @@
 cargo-features = ["edition2021"]
 
 [package]
-name = "simd-tests"
+name = "conv-tests"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,15 +9,11 @@ edition = "2021"
 
 [dependencies]
 criterion = { version = "*", features = [ "real_blackbox" ] }
-genawaiter = "*"
 more-asserts = "*"
-num-traits = "*"
 paste = "*"
 quickcheck = "*"
 quickcheck_macros = "*"
 rand = "*"
-rand_xoshiro = "*"
-rayon = "*"
 core_simd = { path = "../stdsimd/crates/core_simd" }
 
 [[bench]]
@@ -28,7 +24,6 @@ harness = false
 debug = 2
 opt-level = 3
 lto = "fat"
-panic = "abort"
 incremental = false
 codegen-units = 1
 
